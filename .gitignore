@@ -1,0 +1,13 @@
+.venv/
+.venv-*/
+__pycache__/
+*.pyc
+combined_cacert.pem
+*.pem
+ocr_output/
+diag_ocr_output/
+gradio_cached_examples/
+*.log
+diag_load.py
+smoke_test.py
+download_qwen_only.py
