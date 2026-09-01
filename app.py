@@ -168,25 +168,32 @@ def run_paddleocr_vl(image_path, prompt):
 
 
 def run(model_label, image_path, prompt, progress=gr.Progress()):
-    if image_path is None:
-        return "Please upload an image first.", None
     kind = MODELS[model_label]
+    if image_path is None:
+        return "Please upload an image first.", None, gr.update(visible=(kind == "paddleocr_vl"))
     with _lock:
         try:
             ensure_model(kind, progress)
             progress(0.5, desc="Running inference...")
             if kind == "qwen3vl":
-                return run_qwen3vl(image_path, prompt)
+                text, img = run_qwen3vl(image_path, prompt)
             elif kind == "deepseek_ocr":
-                return run_deepseek_ocr(image_path, prompt)
+                text, img = run_deepseek_ocr(image_path, prompt)
             elif kind == "paddleocr_vl":
-                return run_paddleocr_vl(image_path, prompt)
+                text, img = run_paddleocr_vl(image_path, prompt)
         except Exception as e:
-            return f"ERROR: {type(e).__name__}: {e}", None
+            text, img = f"ERROR: {type(e).__name__}: {e}", None
+    html = text if kind == "paddleocr_vl" else ""
+    return text, img, gr.update(value=html, visible=(kind == "paddleocr_vl"))
 
 
 def on_model_change(label):
-    return DEFAULT_PROMPTS[MODELS[label]]
+    kind = MODELS[label]
+    return (
+        DEFAULT_PROMPTS[kind],
+        gr.update(visible=(kind != "paddleocr_vl")),
+        gr.update(visible=(kind == "paddleocr_vl"), value=""),
+    )
 
 
 with gr.Blocks(title="Local Vision Models - RTX 5080") as demo:
@@ -210,11 +217,12 @@ with gr.Blocks(title="Local Vision Models - RTX 5080") as demo:
             )
             run_btn = gr.Button("Run", variant="primary")
         with gr.Column():
-            text_out = gr.Textbox(label="Result", lines=28)
+            text_out = gr.Textbox(label="Result (raw)", lines=28)
             img_out = gr.Image(label="Annotated output (OCR grounding, if produced)")
+            html_out = gr.HTML(label="Rendered table (PaddleOCR-VL)", visible=False)
 
-    model_dd.change(on_model_change, inputs=model_dd, outputs=prompt_in)
-    run_btn.click(run, inputs=[model_dd, image_in, prompt_in], outputs=[text_out, img_out])
+    model_dd.change(on_model_change, inputs=model_dd, outputs=[prompt_in, img_out, html_out])
+    run_btn.click(run, inputs=[model_dd, image_in, prompt_in], outputs=[text_out, img_out, html_out])
 
 if __name__ == "__main__":
     try:
