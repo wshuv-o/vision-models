@@ -9,5 +9,11 @@ diag_ocr_output/
 gradio_cached_examples/
 *.log
 diag_load.py
+diag_qwen.py
+diag_qwen_4bit.py
+diag_paddleocr.py
 smoke_test.py
+smoke_test_qwen.py
+smoke_test_paddle.py
 download_qwen_only.py
+paddleocr_output/

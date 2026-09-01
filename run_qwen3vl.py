@@ -20,7 +20,7 @@ messages = [
     {
         "role": "user",
         "content": [
-            {"type": "image", "image": f"file://{image_file}"},
+            {"type": "image", "image": image_file},
             {"type": "text", "text": question},
         ],
     }
