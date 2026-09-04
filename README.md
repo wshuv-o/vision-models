@@ -1,5 +1,5 @@
 # Local Vision Models — OCR + VLM on RTX 5080
-
+  
 A local Gradio UI for running open-weight OCR and vision-language models entirely
 on your own GPU. Upload an image, pick a model, get a result — nothing leaves
 your machine.
