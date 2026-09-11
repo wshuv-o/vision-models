@@ -46,7 +46,12 @@ Rules:
 - Use null for a field that is genuinely absent on this page.
 - If the page contains nothing matching the instruction, reply with []."""
 
-HTML_PAGE_RE = re.compile(r"<h2>\s*Page\s+(\d+)\s*</h2>", re.I)
+# The OCR stage tags each heading with the page it came from; older files
+# just have "<h2>Page N</h2>".
+HTML_PAGE_RE = re.compile(
+    r'<h2\s+data-page="([^"]*)"\s*>.*?</h2>|<h2>\s*(Page\s+\d+)\s*</h2>',
+    re.I | re.S,
+)
 
 
 def _collapse_runs(cells):
@@ -86,17 +91,125 @@ def load_pages(path):
     raw = io.open(path, encoding="utf-8", errors="replace").read()
 
     if ext in (".html", ".htm"):
-        parts = HTML_PAGE_RE.split(raw)
-        if len(parts) >= 3:
-            return [(f"page {parts[i]}", parts[i + 1])
-                    for i in range(1, len(parts) - 1, 2)]
-        return [("page 1", raw)]
+        marks = list(HTML_PAGE_RE.finditer(raw))
+        if not marks:
+            return [("page 1", raw)]
+        out = []
+        for i, m in enumerate(marks):
+            end = marks[i + 1].start() if i + 1 < len(marks) else len(raw)
+            out.append((m.group(1) or m.group(2) or f"page {i + 1}",
+                        raw[m.end():end]))
+        return out
 
     # .md / .txt -- the OCR stage's page markers
-    return [(f"page {no}", body) for no, body in save_output.split_pages(raw)]
+    return save_output.split_pages(raw)
 
 
 # ------------------------------------------------------------------ llm calls
+CTX_STEPS = [8192, 16384, 32768, 65536, 131072]
+
+# Desktop apps alone sit around 4-5GB on this box; above this something is
+# still holding the card.
+GPU_IDLE_CEILING_MB = 6000
+
+
+def fit_ctx(page_text, instruction, ceiling):
+    """Smallest sane context that still fits this page.
+
+    num_ctx is an allocation request, not a limit: asking for 106k made Ollama
+    demand a 7.5GB pinned host buffer for the CPU-offloaded layers and fail
+    with "unable to allocate CUDA_Host buffer". Pages here are a few thousand
+    characters, so size the window to the page and treat the slider as a cap.
+    """
+    # ~3 chars per token is deliberately pessimistic for table-heavy text.
+    need = (len(page_text) + len(instruction) + len(SYSTEM)) / 3.0 + 1536
+    ceiling = int(ceiling)
+    for c in CTX_STEPS:
+        if c >= need:
+            return min(c, ceiling)
+    return ceiling
+
+
+def is_alloc_error(exc):
+    body = ""
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        body = (getattr(resp, "text", "") or "")
+    text = f"{exc} {body}".lower()
+    return ("unable to allocate" in text or "failed to allocate" in text
+            or "out of memory" in text or "cuda_host" in text)
+
+
+def gpu_used_mb():
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15)
+        return int(out.stdout.strip().splitlines()[0])
+    except Exception:
+        return -1
+
+
+def free_ocr_server():
+    """Free the GPU that stage 1 is holding, and actually mean it.
+
+    WSL2 does not hand GPU memory back to Windows when a process inside it
+    exits -- only when the VM itself stops. Killing `vllm serve` therefore
+    frees nothing as far as Ollama is concerned: the card stayed at 15.3GB and
+    gemma4 had nowhere to load. The whole distro has to go down.
+
+    The OCR app survives this: it detects the dead worker and restarts both it
+    and the server on its next request.
+    """
+    import subprocess
+    before = gpu_used_mb()
+    for cmd in (["wsl.exe", "-e", "bash", "-lc",
+                 "pkill -f 'vllm serve'; pkill -f paddleocr_worker"],
+                ["wsl.exe", "--shutdown"]):
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=120)
+        except Exception:
+            pass
+    for _ in range(30):
+        if gpu_used_mb() < GPU_IDLE_CEILING_MB:
+            break
+        time.sleep(1)
+    return before, gpu_used_mb()
+
+
+def vllm_running(url="http://localhost:8000/v1/models"):
+    try:
+        return requests.get(url, timeout=3).status_code == 200
+    except Exception:
+        return False
+
+
+def wsl_running():
+    """True if any WSL distro is up -- i.e. stage 1 may still hold the card.
+
+    Checked instead of raw GPU usage, because once this stage loads its own
+    model the card is legitimately full and re-freeing would be nonsense.
+    `-l --running` does not start a distro, and prints UTF-16.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(["wsl.exe", "-l", "--running", "--quiet"],
+                             capture_output=True, timeout=30)
+    except Exception:
+        return False
+    raw = out.stdout or b""
+    for enc in ("utf-16-le", "utf-8"):
+        try:
+            text = raw.decode(enc, errors="ignore").replace("\x00", "")
+            if text.strip():
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def call_llm(model, instruction, page_text, num_ctx, timeout=1800):
     body = {
         "model": model,
@@ -110,10 +223,38 @@ def call_llm(model, instruction, page_text, num_ctx, timeout=1800):
         # runs and that is not something you want in extracted figures.
         "options": {"temperature": 0, "num_ctx": int(num_ctx)},
     }
-    r = requests.post(f"{OLLAMA}/api/chat", json=body, timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
-    return (data.get("message") or {}).get("content", "") or ""
+    ctx = int(num_ctx)
+    last = None
+    while True:
+        body["options"]["num_ctx"] = ctx
+        try:
+            r = requests.post(f"{OLLAMA}/api/chat", json=body, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            return (data.get("message") or {}).get("content", "") or "", ctx
+        except Exception as e:
+            # An allocation failure is worth one more try at half the window;
+            # anything else is a real error and should surface immediately.
+            if not is_alloc_error(e) or ctx <= CTX_STEPS[0]:
+                raise
+            last, ctx = e, max(CTX_STEPS[0], ctx // 2)
+            print(f"ctx {ctx * 2} failed to allocate, retrying at {ctx}",
+                  flush=True)
+
+
+def canonicalise_keys(row, canon):
+    """Fold keys that differ only in case/spacing onto one column.
+
+    Models are not consistent between calls: gpt-oss returned Description /
+    Amount for one page and description / amount for the next, which split a
+    3-column table into 5. The first spelling seen wins, so the output keeps
+    whatever the model called it first.
+    """
+    out = {}
+    for k, v in row.items():
+        norm = re.sub(r"[^a-z0-9]+", "_", str(k).strip().lower()).strip("_")
+        out[canon.setdefault(norm or "field", str(k))] = v
+    return out
 
 
 def parse_rows(reply):
@@ -166,19 +307,39 @@ def run(file_obj, instruction, model, pages_spec, num_ctx, add_page_col,
         pages = [pages[i] for i in idx]
 
     yield (status(f"{os.path.basename(str(path))}: {len(pages)} page(s), "
-                  f"model={model}, ctx={int(num_ctx)}"), empty, "")
+                  f"model={model}, ctx<={int(num_ctx)} (sized per page)"),
+           empty, "")
 
-    rows, replies = [], []
+    # This model does not fit beside the OCR stage on a 16GB card. Check the
+    # card itself, not just the server: WSL keeps holding the memory after
+    # vllm exits, so the port can be dead while the GPU is still full.
+    if vllm_running() or wsl_running():
+        yield (status(f"stage 1 still holds the GPU ({gpu_used_mb()}MB); "
+                      f"shutting down its WSL session"), empty, "")
+        before, after = free_ocr_server()
+        if after > GPU_IDLE_CEILING_MB:
+            yield (status(f"warning: GPU still at {after}MB -- the model may "
+                          f"fail to load"), empty, "")
+        else:
+            yield status(f"GPU freed: {before}MB -> {after}MB"), empty, ""
+
+    rows, replies, canon = [], [], {}
     t_all = time.time()
     for i, (label, text) in enumerate(pages, 1):
-        yield (status(f"{label}: sending {len(text)} chars to {model} ..."),
+        ctx = fit_ctx(text, instruction, num_ctx)
+        yield (status(f"{label}: sending {len(text)} chars to {model} "
+                      f"(ctx {ctx}) ..."),
                pd.DataFrame(rows), "\n\n".join(replies))
         t = time.time()
         try:
-            reply = call_llm(model, instruction, text, num_ctx)
+            reply, ctx = call_llm(model, instruction, text, ctx)
             err = None
         except Exception as e:
             reply, err = "", f"{type(e).__name__}: {e}"
+            if is_alloc_error(e):
+                err += ("  -- the model could not be allocated even at the "
+                        "smallest context; close other GPU users or pick a "
+                        "smaller model")
         el = time.time() - t
 
         if err:
@@ -195,6 +356,7 @@ def run(file_obj, instruction, model, pages_spec, num_ctx, add_page_col,
             continue
 
         for r in parsed:
+            r = canonicalise_keys(r, canon)
             if add_page_col:
                 r = {"_page": label, **r}
             rows.append(r)
@@ -231,6 +393,35 @@ def save_table(df, file_obj):
     except Exception as e:
         print(f"xlsx failed: {e}", flush=True)
     return gr.update(value=out), "Saved:\n" + "\n".join("  " + p for p in out)
+
+
+def _serve_opts():
+    """Where to listen, and whether to demand a password.
+
+    Defaults to localhost: these pages have no auth of their own and accept
+    file uploads, so binding wider has to be a deliberate act. Set VM_HOST to
+    0.0.0.0 to reach them from another machine, and set VM_USER/VM_PASS unless
+    the network is one you fully trust.
+    """
+    host = os.environ.get("VM_HOST", "127.0.0.1")
+    user, password = os.environ.get("VM_USER"), os.environ.get("VM_PASS")
+    auth = (user, password) if user and password else None
+    share = os.environ.get("VM_SHARE", "").lower() in ("1", "true", "yes")
+    if host != "127.0.0.1" and not auth:
+        print("WARNING: listening on %s with no VM_USER/VM_PASS set -- anyone "
+              "who can reach this port can upload files and read results"
+              % host, flush=True)
+    if share:
+        # A share link is a tunnel through Gradio's relay, so uploads and
+        # results leave this machine even though the model does not. Worth
+        # saying out loud in a project whose point is staying local.
+        print("NOTE: VM_SHARE is on -- a public gradio.live URL will be created "
+              "and traffic will pass through Gradio's servers", flush=True)
+        if not auth:
+            print("REFUSING to open a public link with no password; set "
+                  "VM_USER and VM_PASS", flush=True)
+            share = False
+    return host, auth, share
 
 
 with gr.Blocks(title="Extract values from recognised pages") as demo:
@@ -277,4 +468,7 @@ with gr.Blocks(title="Extract values from recognised pages") as demo:
                    outputs=[files_out, status_out])
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="127.0.0.1", server_port=7861, inbrowser=True)
+    _host, _auth, _share = _serve_opts()
+    demo.queue().launch(server_name=_host, server_port=7861,
+                        inbrowser=(_host == "127.0.0.1"), auth=_auth,
+                        share=_share)

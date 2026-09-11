@@ -1,6 +1,7 @@
 import os
 import gc
 import json
+import itertools
 import collections
 import time
 import atexit
@@ -257,6 +258,23 @@ def run_paddleocr_vl(image_path, prompt):
     return _ocr_request(image_path, prompt)
 
 
+def _as_paths(file_obj):
+    """Normalise the file input to a list of paths.
+
+    gr.File hands back a single object or a list depending on file_count, and
+    the object is sometimes a tempfile wrapper rather than a plain path.
+    """
+    if not file_obj:
+        return []
+    items = file_obj if isinstance(file_obj, (list, tuple)) else [file_obj]
+    out = []
+    for it in items:
+        p = getattr(it, "name", it)
+        if p:
+            out.append(str(p))
+    return out
+
+
 def _ocr_request_batch(image_paths):
     """Recognise several pages in a single worker call (PaddleOCR-VL only)."""
     proc = _state["ocr_proc"]
@@ -292,11 +310,11 @@ def run(model_label, image_path, pdf_file, prompt, pages_spec, dpi, batch=4,
         progress=gr.Progress()):
     """Streaming handler. Yields (status, text, image, html) as pages finish."""
     kind = MODELS[model_label]
-    pdf_path = getattr(pdf_file, "name", pdf_file)
+    pdf_paths = _as_paths(pdf_file)
     show_html = gr.update(visible=(kind == "paddleocr_vl"))
 
-    if not pdf_path and image_path is None:
-        yield "Upload an image or a PDF first.", "", None, show_html
+    if not pdf_paths and image_path is None:
+        yield "Upload an image or one or more PDFs first.", "", None, show_html
         return
 
     log = []
@@ -308,7 +326,7 @@ def run(model_label, image_path, pdf_file, prompt, pages_spec, dpi, batch=4,
     with _lock:
         try:
             # ---------------------------------------------------- single image
-            if not pdf_path:
+            if not pdf_paths:
                 yield status(f"loading {kind}..."), "", None, show_html
                 ensure_model(kind, progress)
                 yield status("running inference..."), "", None, show_html
@@ -320,65 +338,103 @@ def run(model_label, image_path, pdf_file, prompt, pages_spec, dpi, batch=4,
                                                visible=(kind == "paddleocr_vl"))
                 return
 
-            # ------------------------------------------------------ PDF, live
-            total = pdf_pages.page_count(pdf_path)
-            todo = pdf_pages.parse_pages(pages_spec, total)
-            yield (status(f"{os.path.basename(pdf_path)}: {total} pages, "
-                          f"processing {len(todo)} at {int(dpi)} dpi"),
-                   "", None, show_html)
+            # --------------------------------------------- one or more PDFs
+            plan, grand = [], 0
+            for p in pdf_paths:
+                try:
+                    n_total = pdf_pages.page_count(p)
+                    n_todo = len(pdf_pages.parse_pages(pages_spec, n_total))
+                except Exception as e:
+                    yield (status(f"{os.path.basename(p)}: unreadable "
+                                  f"({type(e).__name__}: {e}) - skipping"),
+                           "", None, show_html)
+                    continue
+                plan.append((p, n_total, n_todo))
+                grand += n_todo
+            if not plan:
+                yield status("no readable PDFs"), "", None, show_html
+                return
+
+            multi = len(plan) > 1
+            summary = ", ".join(f"{os.path.basename(p)} ({n}/{t}p)"
+                                for p, t, n in plan)
+            yield (status(f"{len(plan)} PDF(s), {grand} page(s) total at "
+                          f"{int(dpi)} dpi: {summary}"), "", None, show_html)
 
             yield status(f"loading {kind}..."), "", None, show_html
             ensure_model(kind, progress)
 
             work = tempfile.mkdtemp(prefix="pdfpages_")
             t_all = time.time()
-            rendered = []
-            for pno, png, info in pdf_pages.render_pdf(
-                    pdf_path, work, dpi=int(dpi), pages=pages_spec):
-                w, h = info["size"]
-                note = (f", rotated {info['applied_rotation']}deg"
-                        if info["applied_rotation"] else "")
-                rendered.append((pno, png))
-                yield (status(f"page {pno}/{total}: rendered {w}x{h}px{note}"),
-                       "", None, show_html)
+
+            def iter_pages():
+                """Render lazily, so only a batch of PNGs exists at a time."""
+                for idx, (path, _t, _n) in enumerate(plan):
+                    name = os.path.basename(path)
+                    sub = os.path.join(work, f"{idx:03d}")
+                    for pno, png, info in pdf_pages.render_pdf(
+                            path, sub, dpi=int(dpi), pages=pages_spec):
+                        yield name, pno, png, info
 
             # PaddleOCR-VL fans a whole batch of pages out to vLLM at once;
             # DeepSeek-OCR has no batch path, so it stays one page at a time.
             step = int(batch) if kind == "paddleocr_vl" else 1
-            parts, last_img, done = [], None, 0
-            for i in range(0, len(rendered), step):
-                chunk = rendered[i:i + step]
-                lo, hi = chunk[0][0], chunk[-1][0]
-                label = f"page {lo}" if lo == hi else f"pages {lo}-{hi}"
-                yield (status(f"{label}: recognising ({len(chunk)} at once)..."),
+            pages = iter_pages()
+            parts, last_img, done, failed = [], None, 0, 0
+
+            while True:
+                chunk = list(itertools.islice(pages, step))
+                if not chunk:
+                    break
+                first, last = chunk[0], chunk[-1]
+                if len(chunk) == 1:
+                    label = f"{first[0]} p{first[1]}"
+                elif first[0] == last[0]:
+                    label = f"{first[0]} p{first[1]}-{last[1]}"
+                else:
+                    label = f"{first[0]} p{first[1]} .. {last[0]} p{last[1]}"
+
+                yield (status(f"{label}: recognising ({len(chunk)} page(s), "
+                              f"{done}/{grand} done)"),
                        "\n\n".join(parts), last_img, show_html)
                 t = time.time()
                 try:
                     if step > 1:
-                        texts = _ocr_request_batch([p for _, p in chunk])
+                        texts = _ocr_request_batch([c[2] for c in chunk])
                     else:
-                        text, img = _run_one(kind, chunk[0][1], prompt)
+                        text, img = _run_one(kind, chunk[0][2], prompt)
                         texts, last_img = [text], img or last_img
+                    err = None
                 except Exception as e:
-                    texts = [f"ERROR on {label}: {type(e).__name__}: {e}"] * len(chunk)
+                    err = f"{type(e).__name__}: {e}"
+                    texts = [f"ERROR on {label}: {err}"] * len(chunk)
+                    failed += len(chunk)
                 el = time.time() - t
-                for (pno, _), text in zip(chunk, texts):
-                    parts.append(f"<!-- ===== page {pno} ===== -->\n{text}")
+
+                for (name, pno, png, _info), text in zip(chunk, texts):
+                    marker = save_output.page_marker(name if multi else "", pno)
+                    parts.append(f"{marker}\n{text}")
+                    try:
+                        os.remove(png)      # a long batch would fill the disk
+                    except OSError:
+                        pass
                 done += len(chunk)
-                progress(done / max(len(rendered), 1), desc=label)
+                progress(done / max(grand, 1), desc=label)
                 joined = "\n\n".join(parts)
                 html = joined if kind == "paddleocr_vl" else ""
-                yield (status(f"{label}: done in {el:.1f}s "
-                              f"({el / len(chunk):.1f}s/page), "
-                              f"{sum(len(x) for x in texts)} chars"),
-                       joined, last_img,
+                note = f"FAILED after {el:.1f}s -- {err}" if err else (
+                    f"done in {el:.1f}s ({el / len(chunk):.1f}s/page), "
+                    f"{sum(len(x) for x in texts)} chars")
+                yield (status(f"{label}: {note}"), joined, last_img,
                        gr.update(value=html, visible=(kind == "paddleocr_vl")))
 
             joined = "\n\n".join(parts)
             html = joined if kind == "paddleocr_vl" else ""
             el = time.time() - t_all
-            st = status(f"ALL DONE: {len(parts)} pages in {el:.1f}s "
-                        f"({el / max(len(parts), 1):.1f}s/page), {len(joined)} chars")
+            tail = f", {failed} page(s) FAILED" if failed else ""
+            st = status(f"ALL DONE: {len(parts)} page(s) from {len(plan)} PDF(s) "
+                        f"in {el:.1f}s ({el / max(len(parts), 1):.1f}s/page), "
+                        f"{len(joined)} chars{tail}")
             shutil.rmtree(work, ignore_errors=True)
             yield st, joined, last_img, gr.update(value=html,
                                                   visible=(kind == "paddleocr_vl"))
@@ -390,7 +446,11 @@ def save_result(text, pdf_file, image_path):
     """Write the current result to .md / .html / .xlsx and offer them for download."""
     if not text or not str(text).strip():
         return gr.update(value=None), "Nothing to save yet - run something first."
-    src = getattr(pdf_file, "name", pdf_file) or image_path or "output"
+    paths = _as_paths(pdf_file)
+    if len(paths) > 1:
+        src = f"{os.path.splitext(os.path.basename(paths[0]))[0]}_and_{len(paths) - 1}_more"
+    else:
+        src = (paths[0] if paths else None) or image_path or "output"
     try:
         files = save_output.save_all(str(text), base_name=src, out_dir=OUTPUT_DIR)
     except Exception as e:
@@ -408,6 +468,35 @@ def on_model_change(label):
     )
 
 
+def _serve_opts():
+    """Where to listen, and whether to demand a password.
+
+    Defaults to localhost: these pages have no auth of their own and accept
+    file uploads, so binding wider has to be a deliberate act. Set VM_HOST to
+    0.0.0.0 to reach them from another machine, and set VM_USER/VM_PASS unless
+    the network is one you fully trust.
+    """
+    host = os.environ.get("VM_HOST", "127.0.0.1")
+    user, password = os.environ.get("VM_USER"), os.environ.get("VM_PASS")
+    auth = (user, password) if user and password else None
+    share = os.environ.get("VM_SHARE", "").lower() in ("1", "true", "yes")
+    if host != "127.0.0.1" and not auth:
+        print("WARNING: listening on %s with no VM_USER/VM_PASS set -- anyone "
+              "who can reach this port can upload files and read results"
+              % host, flush=True)
+    if share:
+        # A share link is a tunnel through Gradio's relay, so uploads and
+        # results leave this machine even though the model does not. Worth
+        # saying out loud in a project whose point is staying local.
+        print("NOTE: VM_SHARE is on -- a public gradio.live URL will be created "
+              "and traffic will pass through Gradio's servers", flush=True)
+        if not auth:
+            print("REFUSING to open a public link with no password; set "
+                  "VM_USER and VM_PASS", flush=True)
+            share = False
+    return host, auth, share
+
+
 with gr.Blocks(title="Local Vision Models - RTX 5080") as demo:
     gr.Markdown(
         "# Local OCR / VLM\n"
@@ -423,7 +512,8 @@ with gr.Blocks(title="Local Vision Models - RTX 5080") as demo:
                 label="Model",
             )
             image_in = gr.Image(type="filepath", label="Upload image")
-            pdf_in = gr.File(label="...or upload a PDF", file_types=[".pdf"])
+            pdf_in = gr.File(label="...or upload PDFs (several is fine)",
+                             file_types=[".pdf"], file_count="multiple")
             with gr.Row():
                 pages_in = gr.Textbox(label="Pages", value="",
                                       placeholder="all, or 1-3 / 1,4,7", scale=1)
@@ -459,6 +549,9 @@ with gr.Blocks(title="Local Vision Models - RTX 5080") as demo:
 
 if __name__ == "__main__":
     try:
-        demo.queue().launch(server_name="127.0.0.1", server_port=7860, inbrowser=True)
+        _host, _auth, _share = _serve_opts()
+        demo.queue().launch(server_name=_host, server_port=7860,
+                            inbrowser=(_host == "127.0.0.1"), auth=_auth,
+                            share=_share)
     finally:
         _stop_ocr_worker()
