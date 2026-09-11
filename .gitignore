@@ -17,3 +17,10 @@ smoke_test_qwen.py
 smoke_test_paddle.py
 download_qwen_only.py
 paddleocr_output/
+
+# generated pipeline output
+bench_ui_out/
+vllm_pages_out/
+pipeline_out/
+outputs/
+*.bak
