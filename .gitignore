@@ -28,3 +28,10 @@ outputs/
 uploads/
 # OCR results cache (regenerated on demand)
 .ocr_cache/
+
+# the original, UNSANITISED knowledge pack - never commit this
+LOCAL_AI_KNOWLEDGE.zip
+.kb_out/
+.kb_clean/
+.work_knowledge/
+prompt i gave.txt
