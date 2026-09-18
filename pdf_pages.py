@@ -86,7 +86,14 @@ def render_pdf(pdf_path, out_dir, dpi=300, pages=None, rotate="auto", crop=True)
 
 
 def page_count(pdf_path):
-    return len(pdfium.PdfDocument(str(pdf_path)))
+    doc = pdfium.PdfDocument(str(pdf_path))
+    try:
+        return len(doc)
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
 
 
 def win_to_wsl(path):

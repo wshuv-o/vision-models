@@ -59,19 +59,39 @@ DATE = re.compile(r"[A-Z][a-z]{2,9}\s+\d{1,2},\s+\d{4}")
 
 
 def page_texts(pdf_path, max_pages=None):
-    """[(page_no, text)] from the PDF's own text layer."""
+    """[(page_no, text)] from the PDF's own text layer.
+
+    Every page, textpage and document is closed. Scanning a folder of ninety
+    files otherwise leaves hundreds of handles open, which on Windows also
+    keeps the files locked.
+    """
     doc = pdfium.PdfDocument(str(pdf_path))
-    n = len(doc)
-    if max_pages:
-        n = min(n, max_pages)
-    out = []
-    for i in range(n):
+    try:
+        n = len(doc)
+        if max_pages:
+            n = min(n, max_pages)
+        out = []
+        for i in range(n):
+            page = tp = None
+            try:
+                page = doc[i]
+                tp = page.get_textpage()
+                t = tp.get_text_range() or ""
+            except Exception:
+                t = ""
+            finally:
+                for obj in (tp, page):
+                    try:
+                        obj.close()
+                    except Exception:
+                        pass
+            out.append((i + 1, " ".join(t.split())))
+        return out
+    finally:
         try:
-            t = doc[i].get_textpage().get_text_range() or ""
+            doc.close()
         except Exception:
-            t = ""
-        out.append((i + 1, " ".join(t.split())))
-    return out
+            pass
 
 
 def text_layer_ok(pages, sample=10):

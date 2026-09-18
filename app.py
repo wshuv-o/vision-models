@@ -497,59 +497,70 @@ def _serve_opts():
     return host, auth, share
 
 
-with gr.Blocks(title="Local Vision Models - RTX 5080") as demo:
-    gr.Markdown(
-        "# Local OCR / VLM\n"
-        "Runs entirely on your RTX 5080. Pick a model, upload an image **or a "
-        "PDF**, hit Run. PDFs are processed page by page and stream in live.\n"
-        "Switching models unloads the previous one to stay within 16GB VRAM."
-    )
-    with gr.Row():
-        with gr.Column():
-            model_dd = gr.Dropdown(
-                choices=list(MODELS.keys()),
-                value="PaddleOCR-VL (document OCR)",
-                label="Model",
-            )
-            image_in = gr.Image(type="filepath", label="Upload image")
-            pdf_in = gr.File(label="...or upload PDFs (several is fine)",
-                             file_types=[".pdf"], file_count="multiple")
-            with gr.Row():
-                pages_in = gr.Textbox(label="Pages", value="",
-                                      placeholder="all, or 1-3 / 1,4,7", scale=1)
-                dpi_in = gr.Slider(150, 600, value=300, step=50,
-                                   label="Render DPI", scale=2)
-            batch_in = gr.Slider(1, 16, value=4, step=1,
-                                 label="Pages per vLLM batch (higher = faster, "
-                                       "coarser live updates)")
-            prompt_in = gr.Textbox(
-                value=DEFAULT_PROMPTS["paddleocr_vl"],
-                label="Prompt / instruction",
-                lines=3,
-            )
-            run_btn = gr.Button("Run", variant="primary")
-            with gr.Row():
-                save_btn = gr.Button("Save output (.md / .html / .xlsx)")
-            files_out = gr.File(label="Download", file_count="multiple")
-        with gr.Column():
-            status_out = gr.Textbox(label="Progress (live)", lines=10,
-                                    max_lines=10, autoscroll=True)
-            text_out = gr.Textbox(label="Result (raw)", lines=22)
-            img_out = gr.Image(label="Annotated output (OCR grounding, if produced)")
-            html_out = gr.HTML(label="Rendered table (PaddleOCR-VL)", visible=False)
+def build_demo():
+    """Construct the UI.
 
-    model_dd.change(on_model_change, inputs=model_dd, outputs=[prompt_in, img_out, html_out])
-    save_btn.click(save_result, inputs=[text_out, pdf_in, image_in],
-                   outputs=[files_out, status_out])
-    run_btn.click(
-        run,
-        inputs=[model_dd, image_in, pdf_in, prompt_in, pages_in, dpi_in, batch_in],
-        outputs=[status_out, text_out, img_out, html_out],
-    )
+    Deliberately not executed at import. Other modules import this one to
+    reuse the OCR worker (ensure_model / _ocr_request_batch / stop_vllm),
+    and building Gradio components at import time blew up inside a live
+    request from another app with 'Dropdown' object has no attribute '_id'.
+    """
+    with gr.Blocks(title="Local Vision Models - RTX 5080") as demo:
+        gr.Markdown(
+            "# Local OCR / VLM\n"
+            "Runs entirely on your RTX 5080. Pick a model, upload an image **or a "
+            "PDF**, hit Run. PDFs are processed page by page and stream in live.\n"
+            "Switching models unloads the previous one to stay within 16GB VRAM."
+        )
+        with gr.Row():
+            with gr.Column():
+                model_dd = gr.Dropdown(
+                    choices=list(MODELS.keys()),
+                    value="PaddleOCR-VL (document OCR)",
+                    label="Model",
+                )
+                image_in = gr.Image(type="filepath", label="Upload image")
+                pdf_in = gr.File(label="...or upload PDFs (several is fine)",
+                                 file_types=[".pdf"], file_count="multiple")
+                with gr.Row():
+                    pages_in = gr.Textbox(label="Pages", value="",
+                                          placeholder="all, or 1-3 / 1,4,7", scale=1)
+                    dpi_in = gr.Slider(150, 600, value=300, step=50,
+                                       label="Render DPI", scale=2)
+                batch_in = gr.Slider(1, 16, value=4, step=1,
+                                     label="Pages per vLLM batch (higher = faster, "
+                                           "coarser live updates)")
+                prompt_in = gr.Textbox(
+                    value=DEFAULT_PROMPTS["paddleocr_vl"],
+                    label="Prompt / instruction",
+                    lines=3,
+                )
+                run_btn = gr.Button("Run", variant="primary")
+                with gr.Row():
+                    save_btn = gr.Button("Save output (.md / .html / .xlsx)")
+                files_out = gr.File(label="Download", file_count="multiple")
+            with gr.Column():
+                status_out = gr.Textbox(label="Progress (live)", lines=10,
+                                        max_lines=10, autoscroll=True)
+                text_out = gr.Textbox(label="Result (raw)", lines=22)
+                img_out = gr.Image(label="Annotated output (OCR grounding, if produced)")
+                html_out = gr.HTML(label="Rendered table (PaddleOCR-VL)", visible=False)
+
+        model_dd.change(on_model_change, inputs=model_dd, outputs=[prompt_in, img_out, html_out])
+        save_btn.click(save_result, inputs=[text_out, pdf_in, image_in],
+                       outputs=[files_out, status_out])
+        run_btn.click(
+            run,
+            inputs=[model_dd, image_in, pdf_in, prompt_in, pages_in, dpi_in, batch_in],
+            outputs=[status_out, text_out, img_out, html_out],
+        )
+
+    return demo
 
 if __name__ == "__main__":
     try:
         _host, _auth, _share = _serve_opts()
+        demo = build_demo()
         demo.queue().launch(server_name=_host, server_port=7860,
                             inbrowser=(_host == "127.0.0.1"), auth=_auth,
                             share=_share)

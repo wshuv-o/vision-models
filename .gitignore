@@ -24,3 +24,7 @@ vllm_pages_out/
 pipeline_out/
 outputs/
 *.bak
+
+uploads/
+# OCR results cache (regenerated on demand)
+.ocr_cache/
